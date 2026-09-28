@@ -2,7 +2,7 @@
   "name": "btr-omniroute-cloud",
   "version": "1.0.1",
   "private": true,
-  "engines": { "node": ">=20" },
+  "engines": { "node": "22.x" },
   "scripts": {
     "start": "HOSTNAME=0.0.0.0 DASHBOARD_PORT=$PORT API_PORT=$PORT NODE_ENV=production node node_modules/omniroute/dist/server-ws.mjs"
   },
