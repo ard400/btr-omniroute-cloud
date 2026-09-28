@@ -1,0 +1,12 @@
+﻿{
+  "name": "btr-omniroute-cloud",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "omniroute serve --no-open --port $PORT"
+  },
+  "dependencies": {
+    "omniroute": "3.8.50"
+  }
+}

@@ -1,0 +1,4 @@
+﻿node_modules/
+.omniroute/
+.env
+*.log
