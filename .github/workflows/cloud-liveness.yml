@@ -1,0 +1,61 @@
+name: Cloud liveness no API billing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/cloud-liveness.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/cloud-liveness.yml"
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-liveness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-edge-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Verify cloud edge accepts or rejects according to access policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This admin route intentionally rejects anonymous callers.
+          # HTTP 401/403 proves the public edge and auth gateway answer,
+          # NOT that the database or an AI model is healthy.
+          # The separately authorized ChatGPT health monitor checks DB.
+          url="https://btr-cognitive-cloud.hatchable.site/api/health"
+          code=$(curl --silent --show-error --location --max-redirs 2 \
+                       --connect-timeout 5 --max-time 12 --retry 2 \
+                       --retry-delay 2 --output /dev/null --write-out '%{http_code}' \
+                       "$url")
+          case "$code" in
+            200|401|403)
+              echo "Cloud edge answered HTTP $code (liveness only)."
+              ;;
+            *)
+              echo "::error::Cloud edge status $code not accepted."
+              exit 1
+              ;;
+          esac
+      - name: Publish lightweight summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### BTR Cognitive Cloud liveness"
+            echo ""
+            echo "- Public edge monitor (not a model probe or database audit)"
+            echo "- No API keys, subscriptions, hosted model calls or sensitive data"
+            echo "- Repeats hourly while this workflow remains enabled"
+            echo "- GitHub cron is best effort; it can be delayed or skipped"
+          } >> "$GITHUB_STEP_SUMMARY"
