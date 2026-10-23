@@ -4,12 +4,62 @@ import { resolve } from 'node:path';
 import { bearerMatches, createRemoteAuth, createWorkerClient, inboundEnvelope, isAllowedChat, QR_LIFETIME_MS } from './core.mjs';
 import { createAgentGateway } from './api.mjs';
 
+export const CONTROL_POLL_MS = 10_000;
+
+// The Worker owns the encrypted human command and its expiry. This consumer
+// never exposes its service Bearer to a browser or calls this service's HTTP URL.
+export function createControlPoller({ callWorker, start, stop, now = Date.now, schedule = setInterval, cancel = clearInterval }) {
+  const completed = new Set();
+  let pendingAck = null, polling = false, closed = false;
+  const acknowledge = async () => {
+    if (pendingAck === null || closed) return;
+    await callWorker({ op: 'ack', command_id: pendingAck });
+    pendingAck = null;
+  };
+  const poll = async () => {
+    if (closed || polling) return;
+    polling = true;
+    try {
+      // A failed ACK is retried before fetching another command. The action has
+      // already completed, so a lost response must never execute it twice.
+      await acknowledge();
+      if (closed) return;
+      const { command } = await callWorker({ op: 'control' });
+      if (closed || !command || typeof command.id !== 'string' || !command.id.trim() || command.id.length > 200) return;
+      if (completed.has(command.id)) {
+        pendingAck = command.id;
+        await acknowledge();
+        return;
+      }
+      const expires = typeof command.expires_at === 'string' ? Date.parse(command.expires_at) : NaN;
+      if (!Number.isFinite(expires) || expires <= now() || !['start', 'stop'].includes(command.action)) return;
+      await (command.action === 'start' ? start() : stop());
+      completed.add(command.id);
+      pendingAck = command.id;
+      await acknowledge();
+    } catch {
+      // Offline reads/actions/ACKs are retried on later ticks. Do not log private
+      // payloads or let a control-network failure stop the HTTP API or its timer.
+    } finally { polling = false; }
+  };
+  const timer = schedule(() => { void poll(); }, CONTROL_POLL_MS);
+  timer?.unref?.();
+  return {
+    poll,
+    close() { closed = true; cancel(timer); },
+  };
+}
+
 export async function runBridge(env = process.env) {
   const agentGateway = createAgentGateway();
   let callWorker, baileys, makeWASocket, DisconnectReason, logger, preparing;
+  const workerClient = () => {
+    if (!callWorker) callWorker = createWorkerClient({ endpoint: env.HIDRO_WA_ENDPOINT, token: env.HIDRO_WA_BRIDGE_TOKEN });
+    return callWorker;
+  };
   const prepareWhatsApp = () => {
     if (!preparing) preparing = (async () => {
-      callWorker = createWorkerClient({ endpoint: env.HIDRO_WA_ENDPOINT, token: env.HIDRO_WA_BRIDGE_TOKEN });
+      workerClient();
       baileys = await import('@whiskeysockets/baileys');
       ({ default: makeWASocket, DisconnectReason } = baileys);
       const { default: pino } = await import('pino');
@@ -43,9 +93,10 @@ export async function runBridge(env = process.env) {
     if (starting) return starting;
     if (socket) return;
     starting = (async () => {
-      await prepareWhatsApp();
       const current = ++generation;
       stopped = false;
+      await prepareWhatsApp();
+      if (current !== generation) return;
       const loaded = await callWorker({ op: 'load' });
       if (current !== generation) return;
       allowedChats = Array.isArray(loaded.allowed_chats) ? loaded.allowed_chats : [];
@@ -146,24 +197,40 @@ export async function runBridge(env = process.env) {
   });
   server.requestTimeout = 35_000;
   await new Promise(resolveListen => server.listen(Number(env.PORT || 3000), '0.0.0.0', resolveListen));
+  const control = createControlPoller({
+    callWorker: payload => workerClient()(payload),
+    start: async () => {
+      try { await start(); }
+      catch (error) { await fail('CONTROL_FAILED'); throw error; }
+    },
+    stop: async () => {
+      try { await stop(); }
+      catch (error) { await fail('CONTROL_FAILED'); throw error; }
+    },
+  });
+  const shutdown = () => { control.close(); stop().catch(() => {}).finally(() => server.close()); };
+  process.once('SIGTERM', shutdown); process.once('SIGINT', shutdown);
+  server.once('close', () => { control.close(); process.off('SIGTERM', shutdown); process.off('SIGINT', shutdown); });
+  const bootstrapGeneration = generation;
   try {
   await prepareWhatsApp();
   const existing = await callWorker({ op: 'load' });
-  if (existing.auth) {
-    const restored = JSON.parse(existing.auth, baileys.BufferJSON.reviver);
-    if (restored.creds?.registered) await start();
-    else await sendStatus('ready');
-  } else await sendStatus('ready');
+  if (bootstrapGeneration === generation) {
+    if (existing.auth) {
+      const restored = JSON.parse(existing.auth, baileys.BufferJSON.reviver);
+      if (restored.creds?.registered) await start().catch(() => fail('WHATSAPP_UNAVAILABLE'));
+      else await sendStatus('ready');
+    } else await sendStatus('ready');
+  }
   } catch {
     // The official agent API does not require a WhatsApp QR, session, or secret.
     // Preserve HTTP availability if WhatsApp configuration/dependencies/core fail.
-    stopped = true; generation++; closeSocket();
-    state = 'error'; lastDetail = 'WHATSAPP_UNAVAILABLE';
+    if (bootstrapGeneration === generation) {
+      stopped = true; generation++; closeSocket();
+      state = 'error'; lastDetail = 'WHATSAPP_UNAVAILABLE';
+    }
   }
-  const shutdown = () => { stop().catch(() => {}).finally(() => server.close()); };
-  process.once('SIGTERM', shutdown); process.once('SIGINT', shutdown);
-  server.once('close', () => { process.off('SIGTERM', shutdown); process.off('SIGINT', shutdown); });
-  return { server, start, stop };
+  return { server, start, stop, pollControl: control.poll };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
