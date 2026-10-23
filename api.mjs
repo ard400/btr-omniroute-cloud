@@ -11,7 +11,9 @@ if (core.protocol !== 'https:' || core.origin !== CORE_ORIGIN || core.username |
 }
 const destinations = new Map([
   ['/api/agent', `${CORE_ORIGIN}/api/agent`],
-  ['/mcp', `${CORE_ORIGIN}/mcp`],
+  // /mcp on the application host is reserved by its hosting layer. The Worker
+  // exposes the same authenticated protocol through this explicit API alias.
+  ['/mcp', `${CORE_ORIGIN}/api/mcp`],
 ]);
 const methods = new Set(['GET', 'POST', 'OPTIONS']);
 const cors = {
