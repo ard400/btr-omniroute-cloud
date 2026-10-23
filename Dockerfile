@@ -3,7 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
-COPY core.mjs server.mjs ./
+COPY core.mjs server.mjs api.mjs ./
 USER node
 ENV PORT=3000
 EXPOSE 3000

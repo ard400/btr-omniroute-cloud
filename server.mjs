@@ -2,14 +2,22 @@ import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { bearerMatches, createRemoteAuth, createWorkerClient, inboundEnvelope, isAllowedChat, QR_LIFETIME_MS } from './core.mjs';
+import { createAgentGateway } from './api.mjs';
 
 export async function runBridge(env = process.env) {
-  const callWorker = createWorkerClient({ endpoint: env.HIDRO_WA_ENDPOINT, token: env.HIDRO_WA_BRIDGE_TOKEN });
-  const baileys = await import('@whiskeysockets/baileys');
-  const { default: makeWASocket, DisconnectReason } = baileys;
-  const { default: pino } = await import('pino');
-  // Baileys logs may contain private protocol/auth data. Never send them to platform logs.
-  const logger = pino({ level: 'silent' });
+  const agentGateway = createAgentGateway();
+  let callWorker, baileys, makeWASocket, DisconnectReason, logger, preparing;
+  const prepareWhatsApp = () => {
+    if (!preparing) preparing = (async () => {
+      callWorker = createWorkerClient({ endpoint: env.HIDRO_WA_ENDPOINT, token: env.HIDRO_WA_BRIDGE_TOKEN });
+      baileys = await import('@whiskeysockets/baileys');
+      ({ default: makeWASocket, DisconnectReason } = baileys);
+      const { default: pino } = await import('pino');
+      // Baileys logs may contain private protocol/auth data. Never send them to platform logs.
+      logger = pino({ level: 'silent' });
+    })().catch(error => { preparing = undefined; throw error; });
+    return preparing;
+  };
   let socket, auth, starting, generation = 0, retry = 0, stopped = true;
   let qrTimer, reconnectTimer, heartbeatTimer;
   let state = 'ready', allowedChats = [], lastDetail = null;
@@ -35,6 +43,7 @@ export async function runBridge(env = process.env) {
     if (starting) return starting;
     if (socket) return;
     starting = (async () => {
+      await prepareWhatsApp();
       const current = ++generation;
       stopped = false;
       const loaded = await callWorker({ op: 'load' });
@@ -117,9 +126,11 @@ export async function runBridge(env = process.env) {
   const stop = async () => {
     stopped = true; generation++; closeSocket();
     if (auth) await auth.flush();
+    if (!callWorker) { state = 'disconnected'; lastDetail = 'STOPPED_BY_OPERATOR'; return; }
     await sendStatus('disconnected', { detail: 'STOPPED_BY_OPERATOR' });
   };
   const server = createServer(async (request, response) => {
+    if (await agentGateway(request, response)) return;
     response.setHeader('Content-Type', 'application/json');
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -136,15 +147,22 @@ export async function runBridge(env = process.env) {
   server.requestTimeout = 35_000;
   await new Promise(resolveListen => server.listen(Number(env.PORT || 3000), '0.0.0.0', resolveListen));
   try {
+  await prepareWhatsApp();
   const existing = await callWorker({ op: 'load' });
   if (existing.auth) {
     const restored = JSON.parse(existing.auth, baileys.BufferJSON.reviver);
     if (restored.creds?.registered) await start();
     else await sendStatus('ready');
   } else await sendStatus('ready');
-  } catch (error) { server.close(); throw error; }
+  } catch {
+    // The official agent API does not require a WhatsApp QR, session, or secret.
+    // Preserve HTTP availability if WhatsApp configuration/dependencies/core fail.
+    stopped = true; generation++; closeSocket();
+    state = 'error'; lastDetail = 'WHATSAPP_UNAVAILABLE';
+  }
   const shutdown = () => { stop().catch(() => {}).finally(() => server.close()); };
   process.once('SIGTERM', shutdown); process.once('SIGINT', shutdown);
+  server.once('close', () => { process.off('SIGTERM', shutdown); process.off('SIGINT', shutdown); });
   return { server, start, stop };
 }
 
