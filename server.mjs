@@ -1,0 +1,153 @@
+import { createServer } from 'node:http';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+import { bearerMatches, createRemoteAuth, createWorkerClient, inboundEnvelope, isAllowedChat, QR_LIFETIME_MS } from './core.mjs';
+
+export async function runBridge(env = process.env) {
+  const callWorker = createWorkerClient({ endpoint: env.HIDRO_WA_ENDPOINT, token: env.HIDRO_WA_BRIDGE_TOKEN });
+  const baileys = await import('@whiskeysockets/baileys');
+  const { default: makeWASocket, DisconnectReason } = baileys;
+  const { default: pino } = await import('pino');
+  // Baileys logs may contain private protocol/auth data. Never send them to platform logs.
+  const logger = pino({ level: 'silent' });
+  let socket, auth, starting, generation = 0, retry = 0, stopped = true;
+  let qrTimer, reconnectTimer, heartbeatTimer;
+  let state = 'ready', allowedChats = [], lastDetail = null;
+  let statusTail = Promise.resolve();
+  const sendStatus = (next, { qr = null, expires_at = null, detail = null } = {}) => {
+    state = next; lastDetail = detail;
+    const payload = { op: 'status', state: next, qr, expires_at, detail };
+    statusTail = statusTail.catch(() => {}).then(() => callWorker(payload));
+    return statusTail;
+  };
+  const closeSocket = () => {
+    clearTimeout(qrTimer); clearTimeout(reconnectTimer); clearInterval(heartbeatTimer);
+    const closing = socket; socket = undefined;
+    // end() disconnects this client; it does not unlink the user's device.
+    for (const event of ['connection.update', 'creds.update', 'messages.upsert']) closing?.ev.removeAllListeners(event);
+    try { closing?.end(new Error('HIDRO64_BRIDGE_STOP')); } catch {}
+  };
+  const fail = async code => {
+    stopped = true; generation++; closeSocket();
+    await sendStatus('error', { detail: code }).catch(() => {});
+  };
+  const start = async () => {
+    if (starting) return starting;
+    if (socket) return;
+    starting = (async () => {
+      const current = ++generation;
+      stopped = false;
+      const loaded = await callWorker({ op: 'load' });
+      if (current !== generation) return;
+      allowedChats = Array.isArray(loaded.allowed_chats) ? loaded.allowed_chats : [];
+      auth = createRemoteAuth({ initial: loaded.auth, revision: loaded.revision, library: baileys, callWorker });
+      await auth.saveCreds();
+      if (current !== generation) return;
+      await sendStatus('connecting');
+      if (current !== generation) return;
+      const client = makeWASocket({
+        auth: auth.state, logger, printQRInTerminal: false, markOnlineOnConnect: false,
+        syncFullHistory: false, shouldSyncHistoryMessage: () => false,
+        shouldIgnoreJid: jid => !isAllowedChat(jid, allowedChats),
+        qrTimeout: QR_LIFETIME_MS, connectTimeoutMs: 30_000,
+        getMessage: async () => undefined,
+      });
+      socket = client;
+      client.ev.on('creds.update', update => {
+        if (current === generation) auth.saveCreds(update).catch(() => fail('AUTH_PERSISTENCE_FAILED'));
+      });
+      client.ev.on('connection.update', update => {
+        if (current !== generation) return;
+        (async () => {
+          if (update.qr) {
+            clearTimeout(qrTimer);
+            const expires_at = new Date(Date.now() + QR_LIFETIME_MS).toISOString();
+            await sendStatus('needs_qr', { qr: update.qr, expires_at });
+            qrTimer = setTimeout(() => {
+              if (current === generation && state === 'needs_qr') sendStatus('disconnected', { detail: 'QR_EXPIRED' }).catch(() => fail('STATUS_UNAVAILABLE'));
+            }, QR_LIFETIME_MS);
+          }
+          if (update.connection === 'open') {
+            clearTimeout(qrTimer); retry = 0;
+            await auth.flush();
+            await sendStatus('connected');
+            heartbeatTimer = setInterval(() => {
+              if (current !== generation) return;
+              (async () => {
+                const latest = await callWorker({ op: 'load' });
+                allowedChats = Array.isArray(latest.allowed_chats) ? latest.allowed_chats : [];
+                if (current === generation) await sendStatus('connected');
+              })().catch(() => fail('STATUS_UNAVAILABLE'));
+            }, 30_000);
+          }
+          if (update.connection === 'close') {
+            closeSocket();
+            const code = update.lastDisconnect?.error?.output?.statusCode;
+            if (code === DisconnectReason.loggedOut) {
+              stopped = true;
+              await sendStatus('logged_out', { detail: 'RELINK_REQUIRED' });
+              // Replace revoked credentials with a fresh identity, durably, before another start.
+              await auth.flush();
+              const fresh = createRemoteAuth({ revision: (await callWorker({ op: 'load' })).revision, library: baileys, callWorker });
+              await fresh.saveCreds();
+            } else {
+              await auth.flush();
+              await sendStatus('disconnected', { detail: 'CONNECTION_CLOSED' });
+              if (!stopped && retry++ < 8) reconnectTimer = setTimeout(() => start().catch(() => fail('RECONNECT_FAILED')), Math.min(30_000, 1000 * 2 ** retry));
+            }
+          }
+        })().catch(() => fail('SESSION_FAILED'));
+      });
+      client.ev.on('messages.upsert', event => {
+        if (current !== generation || event.type !== 'notify' || event.requestId) return;
+        (async () => {
+          // Recheck authorization for every batch; the Worker repeats the allowlist check.
+          const loaded = await callWorker({ op: 'load' });
+          allowedChats = Array.isArray(loaded.allowed_chats) ? loaded.allowed_chats : [];
+          if (current !== generation) return;
+          for (const message of event.messages || []) {
+            const payload = inboundEnvelope(message, allowedChats);
+            if (payload) await callWorker(payload);
+          }
+        })().catch(() => fail('INBOUND_STORAGE_FAILED'));
+      });
+    })().finally(() => { starting = undefined; });
+    return starting;
+  };
+  const stop = async () => {
+    stopped = true; generation++; closeSocket();
+    if (auth) await auth.flush();
+    await sendStatus('disconnected', { detail: 'STOPPED_BY_OPERATOR' });
+  };
+  const server = createServer(async (request, response) => {
+    response.setHeader('Content-Type', 'application/json');
+    response.setHeader('Cache-Control', 'no-store');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    const reply = (code, body) => { response.writeHead(code); response.end(JSON.stringify(body)); };
+    if (request.method === 'GET' && request.url === '/health') return reply(200, { ok: true, service: 'hidro64-whatsapp-bridge' });
+    if (!bearerMatches(request.headers.authorization, env.HIDRO_WA_BRIDGE_TOKEN)) return reply(401, { error: 'UNAUTHORIZED' });
+    try {
+      if (request.method === 'GET' && request.url === '/session') return reply(200, { state, detail: lastDetail });
+      if (request.method === 'POST' && request.url === '/session/start') { await start(); return reply(202, { state }); }
+      if (request.method === 'POST' && request.url === '/session/stop') { await stop(); return reply(200, { state }); }
+      return reply(404, { error: 'NOT_FOUND' });
+    } catch { await fail('CONTROL_FAILED'); return reply(503, { error: 'BRIDGE_UNAVAILABLE' }); }
+  });
+  server.requestTimeout = 35_000;
+  await new Promise(resolveListen => server.listen(Number(env.PORT || 3000), '0.0.0.0', resolveListen));
+  try {
+  const existing = await callWorker({ op: 'load' });
+  if (existing.auth) {
+    const restored = JSON.parse(existing.auth, baileys.BufferJSON.reviver);
+    if (restored.creds?.registered) await start();
+    else await sendStatus('ready');
+  } else await sendStatus('ready');
+  } catch (error) { server.close(); throw error; }
+  const shutdown = () => { stop().catch(() => {}).finally(() => server.close()); };
+  process.once('SIGTERM', shutdown); process.once('SIGINT', shutdown);
+  return { server, start, stop };
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  runBridge().catch(() => { console.error('HIDRO64 WhatsApp bridge could not start; verify endpoint, secrets and dependencies.'); process.exitCode = 1; });
+}

@@ -1,12 +1,16 @@
 {
-  "name": "btr-omniroute-cloud",
-  "version": "1.0.1",
+  "name": "hidro64-whatsapp-bridge",
+  "version": "0.1.0",
   "private": true,
-  "engines": { "node": "22.x" },
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
-    "start": "HOSTNAME=0.0.0.0 DASHBOARD_PORT=$PORT API_PORT=$PORT NODE_ENV=production node node_modules/omniroute/dist/server-ws.mjs"
+    "start": "node server.mjs"
   },
   "dependencies": {
-    "omniroute": "3.8.50"
+    "@whiskeysockets/baileys": "6.7.24",
+    "pino": "9.14.0"
   }
 }

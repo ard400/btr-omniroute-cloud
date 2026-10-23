@@ -1,4 +1,4 @@
-﻿node_modules/
-.omniroute/
+node_modules/
 .env
 *.log
+auth_info*
