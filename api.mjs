@@ -18,12 +18,13 @@ const cors = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID',
-  'Access-Control-Expose-Headers': 'Content-Disposition, Content-Type, MCP-Protocol-Version, MCP-Session-Id, WWW-Authenticate',
+  'Access-Control-Expose-Headers': 'Content-Disposition, Content-Type, MCP-Protocol-Version, MCP-Session-Id, WWW-Authenticate, X-Hidro-Api, X-Hidro-Request-Id',
 };
 const requestHeaders = ['content-type', 'accept', 'mcp-protocol-version', 'mcp-session-id', 'last-event-id'];
 const responseHeaders = new Set([
   'content-type', 'content-disposition', 'allow', 'www-authenticate', 'vary',
   'mcp-protocol-version', 'mcp-session-id',
+  'x-hidro-api', 'x-hidro-request-id',
 ]);
 
 function defaults(response) {
@@ -157,6 +158,9 @@ export function createAgentGateway({ fetchImpl = globalThis.fetch, timeoutMs = C
         if (typeof value === 'string') headers.set(name, value);
       }
       if (authorization) headers.set('Authorization', authorization);
+      // MCP checks the original browser/tool Origin in the Worker. Preserve it
+      // for that route so this transport cannot bypass its exact-origin policy.
+      if (target === '/mcp' && typeof request.headers.origin === 'string') headers.set('Origin', request.headers.origin);
       // Cookies, Host, Forwarded, CF/IP headers, and all other incoming headers
       // are deliberately absent. Only the user's Bearer authenticates upstream.
       controller = new AbortController();
@@ -172,7 +176,13 @@ export function createAgentGateway({ fetchImpl = globalThis.fetch, timeoutMs = C
       const output = await readResponse(upstream);
       if (response.destroyed || response.writableEnded) return true;
       for (const [name, value] of upstream.headers) {
-        if (responseHeaders.has(name) || (name.startsWith('access-control-') && name !== 'access-control-allow-credentials')) {
+        if (name === 'access-control-expose-headers') {
+          const exposed = value.split(',').map(header => header.trim()).filter(Boolean);
+          for (const header of ['X-Hidro-Api', 'X-Hidro-Request-Id']) {
+            if (!exposed.some(existing => existing.toLowerCase() === header.toLowerCase())) exposed.push(header);
+          }
+          response.setHeader(name, exposed.join(', '));
+        } else if (responseHeaders.has(name) || (name.startsWith('access-control-') && name !== 'access-control-allow-credentials')) {
           response.setHeader(name, value);
         }
       }
