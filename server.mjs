@@ -109,7 +109,7 @@ export async function runBridge(env = process.env) {
             const payload = inboundEnvelope(message, allowedChats);
             if (payload) await callWorker(payload);
           }
-        })().catch(() => fail('INBOUND_STORAGE_FAILED'));
+        })().catch(error => fail(error.code === 'MESSAGE_TEXT_TOO_LONG' ? 'MESSAGE_TEXT_TOO_LONG' : 'INBOUND_STORAGE_FAILED'));
       });
     })().finally(() => { starting = undefined; });
     return starting;

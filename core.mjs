@@ -100,11 +100,16 @@ export function inboundEnvelope(message, allowedChats) {
   // Only text/captions enter HIDRO64. No contacts, history, media bytes or location are collected.
   const text = body.conversation || body.extendedTextMessage?.text || body.imageMessage?.caption || body.videoMessage?.caption || body.documentMessage?.caption;
   if (typeof text !== 'string' || !text.trim()) return null;
+  if (text.length > 64_000) {
+    const error = new RangeError('MESSAGE_TEXT_TOO_LONG');
+    error.code = 'MESSAGE_TEXT_TOO_LONG';
+    throw error;
+  }
   const seconds = Number(message.messageTimestamp);
   if (!Number.isFinite(seconds) || seconds <= 0 || !Number.isFinite(new Date(seconds * 1000).valueOf())) return null;
   return {
     op: 'message', chat_jid: key.remoteJid, sender_jid: key.participant || key.remoteJid,
-    message_id: String(key.id).slice(0, 200), text: text.slice(0, 20_000),
+    message_id: String(key.id).slice(0, 200), text,
     timestamp: new Date(seconds * 1000).toISOString(),
   };
 }
